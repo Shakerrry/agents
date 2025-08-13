@@ -145,6 +145,7 @@ class STT(stt.STT):
             audio_enhancer=True,
             speech_threshold=0.9,
         ),
+        speech_threshold: float | None = None,
     ) -> None:
         """Create a new instance of Gladia STT.
 
@@ -172,6 +173,8 @@ class STT(stt.STT):
             translation_match_original_utterances: Whether to match original utterances with
                                                     translations. Defaults to True.
             pre_processing: Pre-processing configuration for audio enhancement and speech threshold.
+            speech_threshold: Optional override for speech detection threshold in pre-processing. If not
+                               provided, defaults to the value in pre_processing (0.9 by default).
         Raises:
             ValueError: If no API key is provided or found in environment variables.
         """
@@ -200,6 +203,11 @@ class STT(stt.STT):
                 "translation_target_languages is required when translation_enabled is True"
             )
 
+        # Allow explicit speech_threshold override while preserving other pre-processing settings
+        _pre_processing = pre_processing
+        if speech_threshold is not None:
+            _pre_processing = dataclasses.replace(pre_processing, speech_threshold=speech_threshold)
+
         self._opts = STTOptions(
             language_config=language_config,
             interim_results=interim_results,
@@ -209,7 +217,7 @@ class STT(stt.STT):
             encoding=encoding,
             translation_config=translation_config,
             energy_filter=energy_filter,
-            pre_processing=pre_processing,
+            pre_processing=_pre_processing,
         )
         self._session = http_session
         self._streams: weakref.WeakSet[SpeechStream] = weakref.WeakSet()
