@@ -104,7 +104,7 @@ class TranslationConfiguration:
 @dataclass
 class PreProcessingConfiguration:
     audio_enhancer: bool = True
-    speech_threshold: float = 0.99
+    speech_threshold: float = 0.9
 
 @dataclass
 class STTOptions:
@@ -143,7 +143,7 @@ class STT(stt.STT):
         translation_match_original_utterances: bool = True,
         pre_processing: PreProcessingConfiguration = PreProcessingConfiguration(
             audio_enhancer=True,
-            speech_threshold=0.99,
+            speech_threshold=0.9,
         ),
     ) -> None:
         """Create a new instance of Gladia STT.
