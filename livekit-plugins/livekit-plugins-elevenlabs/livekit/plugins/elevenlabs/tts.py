@@ -21,7 +21,7 @@ import json
 import os
 import weakref
 from dataclasses import dataclass, replace
-from typing import Any, Union
+from typing import Any, Literal, Union
 
 import aiohttp
 
@@ -88,12 +88,15 @@ class TTS(tts.TTS):
         streaming_latency: NotGivenOr[int] = NOT_GIVEN,
         inactivity_timeout: int = WS_INACTIVITY_TIMEOUT,
         auto_mode: NotGivenOr[bool] = NOT_GIVEN,
+        apply_text_normalization: Literal["auto", "off", "on"] = "auto",
         word_tokenizer: NotGivenOr[tokenize.WordTokenizer | tokenize.SentenceTokenizer] = NOT_GIVEN,
         enable_ssml_parsing: bool = False,
+        enable_logging: bool = True,
         chunk_length_schedule: NotGivenOr[list[int]] = NOT_GIVEN,  # range is [50, 500]
         http_session: aiohttp.ClientSession | None = None,
         language: NotGivenOr[str] = NOT_GIVEN,
         sync_alignment: bool = True,
+        preferred_alignment: Literal["normalized", "original"] = "normalized",
     ) -> None:
         """
         Create a new instance of ElevenLabs TTS.
@@ -109,10 +112,12 @@ class TTS(tts.TTS):
             auto_mode (bool): Reduces latency by disabling chunk schedule and buffers. Sentence tokenizer will be used to synthesize one sentence at a time. Defaults to True.
             word_tokenizer (NotGivenOr[tokenize.WordTokenizer | tokenize.SentenceTokenizer]): Tokenizer for processing text. Defaults to basic WordTokenizer.
             enable_ssml_parsing (bool): Enable SSML parsing for input text. Defaults to False.
+            enable_logging (bool): Enable logging of the request. When set to false, zero retention mode will be used. Defaults to True.
             chunk_length_schedule (NotGivenOr[list[int]]): Schedule for chunk lengths, ranging from 50 to 500. Defaults are [120, 160, 250, 290].
             http_session (aiohttp.ClientSession | None): Custom HTTP session for API requests. Optional.
             language (NotGivenOr[str]): Language code for the TTS model, as of 10/24/24 only valid for "eleven_turbo_v2_5".
             sync_alignment (bool): Enable sync alignment for the TTS model. Defaults to True.
+            preferred_alignment (Literal["normalized", "original"]): Use normalized or original alignment. Defaults to "normalized".
         """  # noqa: E501
 
         if not is_given(encoding):
@@ -147,7 +152,6 @@ class TTS(tts.TTS):
                 "auto_mode is enabled, it expects full sentences or phrases, "
                 "please provide a SentenceTokenizer instead of a WordTokenizer."
             )
-
         self._opts = _TTSOptions(
             voice_id=voice_id,
             voice_settings=voice_settings,
@@ -160,16 +164,27 @@ class TTS(tts.TTS):
             word_tokenizer=word_tokenizer,
             chunk_length_schedule=chunk_length_schedule,
             enable_ssml_parsing=enable_ssml_parsing,
+            enable_logging=enable_logging,
             language=language,
             inactivity_timeout=inactivity_timeout,
             sync_alignment=sync_alignment,
             auto_mode=auto_mode,
+            apply_text_normalization=apply_text_normalization,
+            preferred_alignment=preferred_alignment,
         )
         self._session = http_session
         self._streams = weakref.WeakSet[SynthesizeStream]()
 
         self._current_connection: _Connection | None = None
         self._connection_lock = asyncio.Lock()
+
+    @property
+    def model(self) -> str:
+        return self._opts.model
+
+    @property
+    def provider(self) -> str:
+        return "ElevenLabs"
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         if not self._session:
@@ -443,8 +458,11 @@ class _TTSOptions:
     word_tokenizer: tokenize.WordTokenizer | tokenize.SentenceTokenizer
     chunk_length_schedule: NotGivenOr[list[int]]
     enable_ssml_parsing: bool
+    enable_logging: bool
     inactivity_timeout: int
     sync_alignment: bool
+    apply_text_normalization: Literal["auto", "on", "off"]
+    preferred_alignment: Literal["normalized", "original"]
     auto_mode: NotGivenOr[bool]
 
 
@@ -630,14 +648,25 @@ class _Connection:
                 stream = ctx.stream
 
                 # ensure alignment
-                alignment = data.get("normalizedAlignment") or data.get("alignment")
+                alignment = (
+                    data.get("normalizedAlignment")
+                    if self._opts.preferred_alignment == "normalized"
+                    else data.get("alignment")
+                )
                 if alignment and stream is not None:
-                    stream._text_buffer += "".join(alignment["chars"])
+                    chars = alignment["chars"]
                     starts = alignment.get("charStartTimesMs") or alignment.get("charsStartTimesMs")
                     durs = alignment.get("charDurationsMs") or alignment.get("charsDurationsMs")
-                    if starts and durs:
-                        stream._start_times_ms += starts
-                        stream._durations_ms += durs
+                    if starts and durs and len(chars) == len(durs) and len(starts) == len(durs):
+                        stream._text_buffer += "".join(chars)
+                        # in case item in chars has multiple characters
+                        for char, start, dur in zip(chars, starts, durs):
+                            if len(char) > 1:
+                                stream._start_times_ms += [start] * (len(char) - 1)
+                                stream._durations_ms += [0] * (len(char) - 1)
+                            stream._start_times_ms.append(start)
+                            stream._durations_ms.append(dur)
+
                         timed_words, stream._text_buffer = _to_timed_words(
                             stream._text_buffer, stream._start_times_ms, stream._durations_ms
                         )
@@ -768,7 +797,9 @@ def _multi_stream_url(opts: _TTSOptions) -> str:
     if is_given(opts.language):
         params.append(f"language_code={opts.language}")
     params.append(f"enable_ssml_parsing={str(opts.enable_ssml_parsing).lower()}")
+    params.append(f"enable_logging={str(opts.enable_logging).lower()}")
     params.append(f"inactivity_timeout={opts.inactivity_timeout}")
+    params.append(f"apply_text_normalization={opts.apply_text_normalization}")
     if opts.sync_alignment:
         params.append("sync_alignment=true")
     if is_given(opts.auto_mode):

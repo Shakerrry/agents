@@ -1,4 +1,5 @@
-from typing import Literal, Union
+from dataclasses import dataclass
+from typing import Literal, Optional, TypedDict, Union
 
 from openai.types import AudioModel
 
@@ -64,6 +65,36 @@ AssistantTools = Literal["code_interpreter", "file_search", "function"]
 TelnyxChatModels = Literal[
     "meta-llama/Meta-Llama-3.1-8B-Instruct",
     "meta-llama/Meta-Llama-3.1-70B-Instruct",
+]
+
+NebiusChatModels = Literal[
+    "meta-llama/Meta-Llama-3.1-70B-Instruct",
+    "meta-llama/Llama-3.3-70B-Instruct",
+    "meta-llama/Llama-3.3-8B-Instruct",
+    "meta-llama/Meta-Llama-3.1-405B-Instruct",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "moonshotai/Kimi-K2-Instruct",
+    "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+    "NousResearch/Hermes-4-405B",
+    "NousResearch/Hermes-4-70B",
+    "zai-org/GLM-4.5",
+    "zai-org/GLM-4.5-Air",
+    "deepseek-ai/DeepSeek-R1-0528",
+    "deepseek-ai/DeepSeek-R1",
+    "deepseek-ai/DeepSeek-V3",
+    "deepseek-ai/DeepSeek-V3-0324",
+    "Qwen/Qwen3-235B-A22B-Instruct-2507",
+    "Qwen/Qwen3-235B-A22B",
+    "Qwen/Qwen3-32B",
+    "Qwen/Qwen3-30B-A3B",
+    "Qwen/Qwen3-4B-fast",
+    "Qwen/Qwen3-14B",
+    "Qwen/Qwen2.5-Coder-7B",
+    "Qwen/Qwen2.5-Coder-32B-Instruct",
+    "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1",
+    "mistralai/Mistral-Nemo-Instruct-2407",
+    "google/gemma-2-2b-it",
 ]
 
 CerebrasChatModels = Literal[
@@ -222,3 +253,26 @@ def _supports_reasoning_effort(model: Union[ChatModels, str]) -> bool:
         "gpt-5-mini",
         "gpt-5-nano",
     ]
+
+
+@dataclass
+class OpenRouterWebPlugin:
+    """OpenRouter web search plugin configuration"""
+
+    max_results: int = 5
+    search_prompt: Optional[str] = None
+    id: str = "web"
+
+
+class OpenRouterProviderPreferences(TypedDict, total=False):
+    """OpenRouter provider routing preferences."""
+
+    order: list[str]
+    allow_fallbacks: bool
+    require_parameters: bool
+    data_collection: Literal["allow", "deny"]
+    only: list[str]
+    ignore: list[str]
+    quantizations: list[str]
+    sort: Literal["price", "throughput", "latency"]
+    max_price: dict[str, float]
