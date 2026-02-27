@@ -30,6 +30,7 @@ from livekit.agents import (
     DEFAULT_API_CONNECT_OPTIONS,
     APIConnectOptions,
     APIStatusError,
+    Language,
     stt,
     utils,
 )
@@ -57,6 +58,7 @@ class STTOptions:
     max_turn_silence: NotGivenOr[int] = NOT_GIVEN
     format_turns: NotGivenOr[bool] = NOT_GIVEN
     keyterms_prompt: NotGivenOr[list[str]] = NOT_GIVEN
+    vad_threshold: NotGivenOr[float] = NOT_GIVEN
 
 
 class STT(stt.STT):
@@ -75,9 +77,22 @@ class STT(stt.STT):
         max_turn_silence: NotGivenOr[int] = NOT_GIVEN,
         format_turns: NotGivenOr[bool] = NOT_GIVEN,
         keyterms_prompt: NotGivenOr[list[str]] = NOT_GIVEN,
+        vad_threshold: NotGivenOr[float] = NOT_GIVEN,
         http_session: aiohttp.ClientSession | None = None,
         buffer_size_seconds: float = 0.05,
+        base_url: str = "wss://streaming.assemblyai.com",
     ):
+        """
+        Args:
+            base_url: The AssemblyAI streaming endpoint base URL. Use the EU endpoint
+                (wss://streaming.eu.assemblyai.com) for streaming in the EU. Defaults to
+                wss://streaming.assemblyai.com.
+                See https://www.assemblyai.com/docs/universal-streaming for more details.
+            vad_threshold: The threshold for voice activity detection (VAD). A value between
+                0 and 1 that determines how sensitive the VAD is. Lower values make the VAD
+                more sensitive (detects quieter speech). Higher values make it less sensitive.
+                Defaults to 0.4.
+        """
         super().__init__(
             capabilities=stt.STTCapabilities(
                 streaming=True,
@@ -86,6 +101,7 @@ class STT(stt.STT):
                 offline_recognize=False,
             ),
         )
+        self._base_url = base_url
         assemblyai_api_key = api_key if is_given(api_key) else os.environ.get("ASSEMBLYAI_API_KEY")
         if not assemblyai_api_key:
             raise ValueError(
@@ -94,6 +110,12 @@ class STT(stt.STT):
                 "or set it as the `ASSEMBLYAI_API_KEY` environment variable"
             )
         self._api_key = assemblyai_api_key
+
+        # we want to minimize latency as much as possible, it's ok if the phrase arrives in multiple final transcripts
+        # designed to work with LK's end of turn models
+        if not is_given(min_end_of_turn_silence_when_confident):
+            min_end_of_turn_silence_when_confident = 100
+
         self._opts = STTOptions(
             sample_rate=sample_rate,
             buffer_size_seconds=buffer_size_seconds,
@@ -105,6 +127,7 @@ class STT(stt.STT):
             max_turn_silence=max_turn_silence,
             format_turns=format_turns,
             keyterms_prompt=keyterms_prompt,
+            vad_threshold=vad_threshold,
         )
         self._session = http_session
         self._streams = weakref.WeakSet[SpeechStream]()
@@ -145,6 +168,7 @@ class STT(stt.STT):
             opts=config,
             api_key=self._api_key,
             http_session=self.session,
+            base_url=self._base_url,
         )
         self._streams.add(stream)
         return stream
@@ -156,6 +180,7 @@ class STT(stt.STT):
         end_of_turn_confidence_threshold: NotGivenOr[float] = NOT_GIVEN,
         min_end_of_turn_silence_when_confident: NotGivenOr[int] = NOT_GIVEN,
         max_turn_silence: NotGivenOr[int] = NOT_GIVEN,
+        vad_threshold: NotGivenOr[float] = NOT_GIVEN,
     ) -> None:
         if is_given(buffer_size_seconds):
             self._opts.buffer_size_seconds = buffer_size_seconds
@@ -167,6 +192,8 @@ class STT(stt.STT):
             )
         if is_given(max_turn_silence):
             self._opts.max_turn_silence = max_turn_silence
+        if is_given(vad_threshold):
+            self._opts.vad_threshold = vad_threshold
 
         for stream in self._streams:
             stream.update_options(
@@ -174,6 +201,7 @@ class STT(stt.STT):
                 end_of_turn_confidence_threshold=end_of_turn_confidence_threshold,
                 min_end_of_turn_silence_when_confident=min_end_of_turn_silence_when_confident,
                 max_turn_silence=max_turn_silence,
+                vad_threshold=vad_threshold,
             )
 
 
@@ -189,12 +217,14 @@ class SpeechStream(stt.SpeechStream):
         conn_options: APIConnectOptions,
         api_key: str,
         http_session: aiohttp.ClientSession,
+        base_url: str,
     ) -> None:
         super().__init__(stt=stt, conn_options=conn_options, sample_rate=opts.sample_rate)
 
         self._opts = opts
         self._api_key = api_key
         self._session = http_session
+        self._base_url = base_url
         self._speech_duration: float = 0
         self._last_preflight_start_time: float = 0
         self._reconnect_event = asyncio.Event()
@@ -206,6 +236,7 @@ class SpeechStream(stt.SpeechStream):
         end_of_turn_confidence_threshold: NotGivenOr[float] = NOT_GIVEN,
         min_end_of_turn_silence_when_confident: NotGivenOr[int] = NOT_GIVEN,
         max_turn_silence: NotGivenOr[int] = NOT_GIVEN,
+        vad_threshold: NotGivenOr[float] = NOT_GIVEN,
     ) -> None:
         if is_given(buffer_size_seconds):
             self._opts.buffer_size_seconds = buffer_size_seconds
@@ -217,6 +248,8 @@ class SpeechStream(stt.SpeechStream):
             )
         if is_given(max_turn_silence):
             self._opts.max_turn_silence = max_turn_silence
+        if is_given(vad_threshold):
+            self._opts.vad_threshold = vad_threshold
 
         self._reconnect_event.set()
 
@@ -274,7 +307,9 @@ class SpeechStream(stt.SpeechStream):
 
                     raise APIStatusError(
                         "AssemblyAI connection closed unexpectedly",
-                    )  # this will trigger a reconnection, see the _run loop
+                        status_code=ws.close_code or -1,
+                        body=f"{msg.data=} {msg.extra=}",
+                    )
 
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     logger.error("unexpected AssemblyAI message type %s", msg.type)
@@ -338,6 +373,9 @@ class SpeechStream(stt.SpeechStream):
             else True
             if "multilingual" in self._opts.speech_model
             else False,
+            "vad_threshold": self._opts.vad_threshold
+            if is_given(self._opts.vad_threshold)
+            else None,
         }
 
         headers = {
@@ -346,13 +384,12 @@ class SpeechStream(stt.SpeechStream):
             "User-Agent": "AssemblyAI/1.0 (integration=Livekit)",
         }
 
-        ws_url = "wss://streaming.assemblyai.com/v3/ws"
         filtered_config = {
             k: ("true" if v else "false") if isinstance(v, bool) else v
             for k, v in live_config.items()
             if v is not None
         }
-        url = f"{ws_url}?{urlencode(filtered_config)}"
+        url = f"{self._base_url}/v3/ws?{urlencode(filtered_config)}"
         ws = await self._session.ws_connect(url, headers=headers)
         return ws
 
@@ -365,7 +402,7 @@ class SpeechStream(stt.SpeechStream):
         turn_is_formatted = data.get("turn_is_formatted", False)
         utterance = data.get("utterance", "")
         transcript = data.get("transcript", "")
-        language = data.get("language_code", "en")
+        language = Language(data.get("language_code", "en"))
 
         # transcript (final) and words (interim) are cumulative
         # utterance (preflight) is chunk based
