@@ -203,20 +203,15 @@ def _oai_session_to_azure(session: RealtimeSessionCreateRequest) -> AzureSession
 def _normalize_azure_client_event(event: dict[str, Any]) -> None:
     """In-place normalization of client event dicts for Azure compatibility.
 
-    The OpenAI SDK Pydantic models enforce 'input_text' for user/system content,
-    but Azure's Realtime API now requires 'text' instead. We also convert
-    'output_text' (assistant) to 'input_text' which Azure still expects.
+    Azure keeps 'input_text' for user/system content (same as SDK default).
+    For assistant content, Azure requires 'text' instead of 'output_text'.
     """
     item = event.get("item")
     if item is None:
         return
-    role = item.get("role")
     for content_part in item.get("content", ()):
-        ctype = content_part.get("type")
-        if role in ("user", "system", "developer") and ctype == "input_text":
+        if content_part.get("type") == "output_text":
             content_part["type"] = "text"
-        elif role == "assistant" and ctype == "output_text":
-            content_part["type"] = "input_text"
 
 
 @dataclass
