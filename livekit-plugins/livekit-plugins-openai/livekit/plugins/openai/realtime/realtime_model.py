@@ -203,14 +203,14 @@ def _oai_session_to_azure(session: RealtimeSessionCreateRequest) -> AzureSession
 def _normalize_azure_client_event(event: dict[str, Any]) -> None:
     """In-place normalization of client event dicts for Azure compatibility.
 
-    Azure uses "input_text" for all text content parts (including assistant messages),
-    while the standard OpenAI API uses "text" for user/system and "output_text" for assistant.
+    Azure now accepts "text" for user/system content (matching standard OpenAI),
+    but still uses "input_text" for assistant content instead of "output_text".
     """
     item = event.get("item")
     if item is None:
         return
     for content_part in item.get("content", ()):
-        if content_part.get("type") in ("output_text", "text"):
+        if content_part.get("type") == "output_text":
             content_part["type"] = "input_text"
 
 
@@ -932,8 +932,6 @@ class RealtimeSession(
                             by_alias=True, exclude_unset=True, exclude_defaults=False
                         )
 
-                    # Azure uses "input_text" for all content parts, while
-                    # the new API uses "output_text" for assistant content.
                     if self._realtime_model._opts.is_azure:
                         _normalize_azure_client_event(msg)
 
