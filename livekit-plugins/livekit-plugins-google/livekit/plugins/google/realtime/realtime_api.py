@@ -700,13 +700,18 @@ class RealtimeSession(llm.RealtimeSession):
             )
             self._in_user_activity = False
 
-        # Gemini requires the last message to end with user's turn
-        # so we need to add a placeholder user turn in order to trigger a new generation
-        turns = []
-        if is_given(instructions):
-            turns.append(types.Content(parts=[types.Part(text=instructions)], role="model"))
-        turns.append(types.Content(parts=[types.Part(text=".")], role="user"))
-        self._send_client_event(types.LiveClientContent(turns=turns, turn_complete=True))
+        # Gemini 3.1+ rejects send_client_content for non-initial-history use,
+        # so use send_realtime_input(text=...) instead.
+        _model_base = self._opts.model.removeprefix("models/")
+        if _model_base.startswith("gemini-3"):
+            prompt = instructions if is_given(instructions) else "."
+            self._send_client_event(types.LiveClientRealtimeInput(text=prompt))
+        else:
+            turns = []
+            if is_given(instructions):
+                turns.append(types.Content(parts=[types.Part(text=instructions)], role="model"))
+            turns.append(types.Content(parts=[types.Part(text=".")], role="user"))
+            self._send_client_event(types.LiveClientContent(turns=turns, turn_complete=True))
 
         def _on_timeout() -> None:
             if not fut.done():
