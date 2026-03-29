@@ -158,7 +158,7 @@ def livekit_item_to_openai_item(item: llm.ChatItem) -> realtime.ConversationItem
                 if isinstance(c, str):
                     system_content.append(
                         realtime.realtime_conversation_item_system_message.Content(
-                            type="input_text",
+                            type="text",
                             text=c,
                         )
                     )
@@ -191,7 +191,7 @@ def livekit_item_to_openai_item(item: llm.ChatItem) -> realtime.ConversationItem
                 if isinstance(c, str):
                     user_content.append(
                         realtime.realtime_conversation_item_user_message.Content(
-                            type="input_text",
+                            type="text",
                             text=c,
                         )
                     )

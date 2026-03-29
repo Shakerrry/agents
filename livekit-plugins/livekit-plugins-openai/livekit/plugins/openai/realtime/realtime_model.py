@@ -204,13 +204,13 @@ def _normalize_azure_client_event(event: dict[str, Any]) -> None:
     """In-place normalization of client event dicts for Azure compatibility.
 
     Azure uses "input_text" for all text content parts (including assistant messages),
-    while the new OpenAI API uses "output_text" for assistant content.
+    while the standard OpenAI API uses "text" for user/system and "output_text" for assistant.
     """
     item = event.get("item")
     if item is None:
         return
     for content_part in item.get("content", ()):
-        if content_part.get("type") == "output_text":
+        if content_part.get("type") in ("output_text", "text"):
             content_part["type"] = "input_text"
 
 
