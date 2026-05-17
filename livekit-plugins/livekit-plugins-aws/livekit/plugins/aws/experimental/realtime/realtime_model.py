@@ -44,10 +44,9 @@ from livekit.agents.metrics import RealtimeModelMetrics
 from livekit.agents.metrics.base import Metadata
 from livekit.agents.types import NOT_GIVEN, NotGivenOr
 from livekit.agents.utils import is_given
-from ...log import logger
 from livekit.plugins.aws.experimental.realtime.turn_tracker import _TurnTracker
 
-
+from ...log import logger
 from .events import (
     SonicEventBuilder as seb,
     Tool,
@@ -214,10 +213,16 @@ class Boto3CredentialsResolver(IdentityResolver):  # type: ignore[misc]
         Raises:
             ValueError: If no credentials could be found by boto3.
         """
-        # Return cached credentials if available
-        # Session recycling will close the connection and get fresh credentials before these expire
-        if self._cached_identity:
+        # Return cached credentials if available and not expired
+        current_time = time.time()
+        if self._cached_identity and (
+            self._cached_expiry is None or current_time < self._cached_expiry
+        ):
             return self._cached_identity
+
+        # Credentials expired or not cached - reset so fresh ones are fetched below
+        self._cached_identity = None
+        self._cached_expiry = None
 
         try:
             logger.debug("[CREDS] Attempting to load AWS credentials")
@@ -333,6 +338,7 @@ class RealtimeModel(llm.RealtimeModel):
                 auto_tool_reply_generation=True,
                 audio_output=True,
                 manual_function_calls=False,
+                per_response_tool_choice=False,
             )
         )
         self._model = model
@@ -526,7 +532,9 @@ class RealtimeSession(  # noqa: F811
         self._pending_generation_fut: asyncio.Future[llm.GenerationCreatedEvent] | None = None
         self._sent_message_ids: set[str] = set()
         self._audio_message_ids: set[str] = set()
-        self._no_gen_content_roles: dict[str, str] = {}  # contentId → role for events without generation
+        self._no_gen_content_roles: dict[
+            str, str
+        ] = {}  # contentId → role for events without generation
         self._current_user_content_id: str | None = None  # track current user utterance
         # Signalled after await_output() returns (HTTP 200 received).
         # Interactive text must wait for this to avoid being sent before
@@ -862,6 +870,7 @@ class RealtimeSession(  # noqa: F811
             assert self._bedrock_client is not None, "bedrock_client is None"
 
             logger.info("Initializing Bedrock stream")
+            t0 = time.perf_counter()
             self._stream_response = (
                 await self._bedrock_client.invoke_model_with_bidirectional_stream(
                     InvokeModelWithBidirectionalStreamOperationInput(
@@ -869,6 +878,7 @@ class RealtimeSession(  # noqa: F811
                     )
                 )
             )
+            self._report_connection_acquired(time.perf_counter() - t0)
 
             if not is_restart:
                 # Lazy-initialize futures if needed
@@ -972,22 +982,23 @@ class RealtimeSession(  # noqa: F811
                 await self._send_raw_event(event)
                 await asyncio.sleep(0.01)
 
-            # Step 3: Create audio input task (sends AUDIO contentStart immediately)
-            self._audio_input_task = asyncio.create_task(
-                self._process_audio_input(), name="RealtimeSession._process_audio_input"
-            )
-
+            # Step 3: Start response reader first (calls await_output, sets _stream_ready)
             self._response_task = asyncio.create_task(
                 self._process_responses(), name="RealtimeSession._process_responses"
             )
 
-            # Step 4: Allow audio contentStart to be sent before unblocking
+            # Step 4: Start audio input (waits for _stream_ready before sending audio_content_start)
+            self._audio_input_task = asyncio.create_task(
+                self._process_audio_input(), name="RealtimeSession._process_audio_input"
+            )
+
+            # Step 5: Allow audio contentStart to be sent before unblocking
             # interactive text (generate_reply). This avoids sending AUDIO and TEXT
             # interactive contentStart events simultaneously.
             await asyncio.sleep(0.05)
             self._is_sess_active.set()
 
-            # Step 5: If we popped a user message from history, send it as
+            # Step 6: If we popped a user message from history, send it as
             # interactive text now to trigger Nova Sonic to respond.
             if interactive_user_text:
                 await self._stream_ready.wait()
@@ -1208,7 +1219,9 @@ class RealtimeSession(  # noqa: F811
                 self._current_generation.message_gen.text_ch.send_nowait(text_content)
             self._update_chat_ctx(role="assistant", text_content=text_content)
 
-    def _update_chat_ctx(self, role: llm.ChatRole, text_content: str, content_id: str | None = None) -> None:
+    def _update_chat_ctx(
+        self, role: llm.ChatRole, text_content: str, content_id: str | None = None
+    ) -> None:
         """
         Update the chat context with the latest ASR text while guarding against model limitations:
             a) 40 total messages limit
@@ -1279,6 +1292,24 @@ class RealtimeSession(  # noqa: F811
         tool_use_id = event_data["event"]["toolUse"]["toolUseId"]
         tool_name = event_data["event"]["toolUse"]["toolName"]
         args = event_data["event"]["toolUse"]["content"]
+
+        # Nova Sonic sometimes double-encodes tool arguments: the outer JSON parse
+        # yields a string whose contents are themselves a JSON object string
+        # (e.g. "\"{\\\"order_id\\\":\\\"1234\\\"}\"").
+        # Only peel one layer when the inner string is a JSON object so that
+        # legitimate string-valued schemas (e.g. content="hello") are preserved.
+        if isinstance(args, str):
+            try:
+                parsed = json.loads(args)
+                if isinstance(parsed, str):
+                    try:
+                        inner = json.loads(parsed)
+                        if isinstance(inner, dict):
+                            args = parsed
+                    except (json.JSONDecodeError, TypeError):
+                        pass  # inner string is a plain value, leave args untouched
+            except (json.JSONDecodeError, TypeError):
+                pass
 
         # Emit function call to LiveKit framework
         self._current_generation.function_ch.send_nowait(
@@ -1696,9 +1727,7 @@ class RealtimeSession(  # noqa: F811
                 and self._chat_ctx.items[0].role == "assistant"
             ):
                 removed = self._chat_ctx.items.pop(0)
-                logger.debug(
-                    "Stripped leading assistant message from context: %s", removed.id
-                )
+                logger.debug("Stripped leading assistant message from context: %s", removed.id)
             # Mark all initial context messages as already sent so the loop below
             # doesn't re-send them as interactive=true text. These messages are already
             # sent as non-interactive history via create_prompt_start_block during
@@ -1852,9 +1881,7 @@ class RealtimeSession(  # noqa: F811
         while True:
             try:
                 discarded = self._tool_results_ch.recv_nowait()
-                logger.debug(
-                    f"[SESSION] Discarding stale tool result: {discarded['tool_use_id']}"
-                )
+                logger.debug(f"[SESSION] Discarding stale tool result: {discarded['tool_use_id']}")
             except utils.aio.channel.ChanEmpty:
                 break
         await self._graceful_session_recycle()
@@ -1890,6 +1917,11 @@ class RealtimeSession(  # noqa: F811
     @utils.log_exceptions(logger=logger)
     async def _process_audio_input(self) -> None:
         """Background task that feeds audio and tool results into the Bedrock stream."""
+        # Wait for the bidirectional stream to be fully established (HTTP 200)
+        # before sending audio_content_start_event. Without this, under load
+        # Bedrock may not have finished processing chat history, causing:
+        # ValidationException: "Chat history should be sent completely before streaming audio."
+        await self._stream_ready.wait()
         await self._send_raw_event(self._event_builder.create_audio_content_start_event())
         logger.info("Starting audio input processing loop")
 
@@ -1986,6 +2018,8 @@ class RealtimeSession(  # noqa: F811
         self,
         *,
         instructions: NotGivenOr[str] = NOT_GIVEN,
+        tool_choice: NotGivenOr[llm.ToolChoice] = NOT_GIVEN,
+        tools: NotGivenOr[list[llm.Tool]] = NOT_GIVEN,
     ) -> asyncio.Future[llm.GenerationCreatedEvent]:
         """Generate a reply from the model.
 
@@ -2030,6 +2064,10 @@ class RealtimeSession(  # noqa: F811
             update_chat_ctx() which sends interactive text to Nova Sonic.
             This method handles the instructions parameter for system-level prompts.
         """
+        if is_given(tools):
+            logger.warning(
+                "per-response tools is not supported by AWS Nova Sonic Realtime API, ignoring"
+            )
         # Check if generate_reply is supported (requires mixed modalities)
         if self._realtime_model.modalities != "mixed":
             logger.warning(
@@ -2078,7 +2116,7 @@ class RealtimeSession(  # noqa: F811
                     if self._pending_generation_fut is fut:
                         self._pending_generation_fut = None
 
-            asyncio.create_task(_send_text())
+            send_task = asyncio.create_task(_send_text())
 
             # Set timeout from model configuration
             def _on_timeout() -> None:
@@ -2092,7 +2130,17 @@ class RealtimeSession(  # noqa: F811
             timeout_handle = asyncio.get_running_loop().call_later(
                 self._realtime_model._generate_reply_timeout, _on_timeout
             )
-            fut.add_done_callback(lambda _: timeout_handle.cancel())
+
+            def _on_fut_done(f: asyncio.Future[llm.GenerationCreatedEvent]) -> None:
+                timeout_handle.cancel()
+                is_current = self._pending_generation_fut is fut
+                if is_current:
+                    self._pending_generation_fut = None
+                if f.cancelled() and is_current and not send_task.done():
+                    # external cancel before the text was sent: drop the send
+                    send_task.cancel()
+
+            fut.add_done_callback(_on_fut_done)
 
             return fut
 

@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 
 WRITE_INTERVAL = 2.5
+FFMPEG_STRICT_LEVEL = "experimental"
 
 
 class RecorderIO:
@@ -146,9 +147,24 @@ class RecorderIO:
         self._output_path.parent.mkdir(parents=True, exist_ok=True)
 
         container = av.open(self._output_path, mode="w", format="ogg")
-        stream: av.AudioStream = container.add_stream(
-            "opus", rate=self._sample_rate, layout="stereo"
-        )  # type: ignore
+
+        # prefer libopus; fallback to native opus only if necessary
+        try:
+            av.Codec("libopus", "w")
+            codec_name = "libopus"
+        except av.codec.codec.UnknownCodecError:
+            logger.trace("libopus codec is not available, using opus")
+            codec_name = "opus"
+
+        stream: av.AudioStream = container.add_stream(  # type: ignore
+            codec_name,
+            rate=self._sample_rate,
+            layout="stereo",
+        )
+
+        # native ffmpeg opus encoder is experimental
+        if codec_name == "opus":
+            stream.codec_context.options["strict"] = FFMPEG_STRICT_LEVEL
 
         in_resampler: rtc.AudioResampler | None = None
         out_resampler: rtc.AudioResampler | None = None
@@ -478,6 +494,7 @@ class RecorderAudioOutput(io.AudioOutput):
             if pause_pos <= playback_position:
                 buf.append(_create_silence_frame(pause_dur, sample_rate, num_channels))
 
+        buf = [f for f in buf if f.duration > 0.0]
         if buf:
             if trailing_silence_duration > 0.0:
                 buf.append(
