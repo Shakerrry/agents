@@ -774,15 +774,14 @@ class RealtimeSession(llm.RealtimeSession):
         if is_given(tools):
             logger.warning("per-response tools is not supported by Google Realtime API, ignoring")
         if not self._realtime_model.capabilities.mutable_chat_context:
-            # FORK PATCH (bd9132248 + extended on submodule sync 2026-05-17):
-            # Gemini 3.x has mutable_chat_context=False (line 292:
-            # `mutable = "3.1" not in model`), which upstream uses to reject
-            # generate_reply outright. But Gemini 3.x DOES support an
-            # initial-speech trigger via send_realtime_input(text=...) — see
-            # the gemini-3 branch below at the `_model_base.startswith("gemini-3")`
-            # site. Skip the early-return for Gemini 3.x so that path runs.
-            # Other immutable-context models (none currently in our DB) still
-            # get the original hard error.
+            # FORK PATCH (bd9132248, extended 2026-05-17, re-verified on the
+            # 1.7.0 sync): Gemini 3.x reports mutable_chat_context=False (see
+            # `mutable = "3.1" not in model` in RealtimeModel.__init__), which
+            # upstream uses to reject generate_reply outright. Gemini 3.x does
+            # support an initial-speech trigger via send_realtime_input(text=),
+            # handled by the gemini-3 branch further down in this method, so
+            # skip the early return for it. Other immutable-context models
+            # (none currently in our DB) still get the original hard error.
             _model_base = self._opts.model.removeprefix("models/")
             if not _model_base.startswith("gemini-3"):
                 logger.warning(
@@ -790,9 +789,7 @@ class RealtimeSession(llm.RealtimeSession):
                 )
                 fut = asyncio.Future[llm.GenerationCreatedEvent]()
                 fut.set_exception(
-                    llm.RealtimeError(
-                        f"generate_reply is not compatible with '{self._opts.model}'"
-                    )
+                    llm.RealtimeError(f"generate_reply is not compatible with '{self._opts.model}'")
                 )
                 return fut
         if self._pending_generation_fut and not self._pending_generation_fut.done():
@@ -816,8 +813,9 @@ class RealtimeSession(llm.RealtimeSession):
             )
             self._in_user_activity = False
 
-        # Gemini 3.1+ rejects send_client_content for non-initial-history use,
-        # so use send_realtime_input(text=...) instead.
+        # FORK PATCH (bd9132248): Gemini 3.1+ rejects send_client_content for
+        # non-initial-history use, so trigger generation with
+        # send_realtime_input(text=...) instead.
         _model_base = self._opts.model.removeprefix("models/")
         if _model_base.startswith("gemini-3"):
             prompt = instructions if is_given(instructions) else "."
