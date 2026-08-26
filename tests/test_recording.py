@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import inspect
+import ssl
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
+from google.rpc import error_details_pb2, status_pb2
 
 from livekit.agents import Agent, AgentSession
 from livekit.agents.telemetry.traces import _upload_session_report
@@ -17,12 +21,15 @@ from livekit.agents.voice.agent_session import (
     _RECORDING_ALL_ON,
     RecordingOptions,
 )
+from livekit.protocol import metrics as proto_metrics
 
 from .fake_io import FakeAudioInput, FakeAudioOutput, FakeTextOutput
 from .fake_llm import FakeLLM
 from .fake_stt import FakeSTT
 from .fake_tts import FakeTTS
 from .fake_vad import FakeVAD
+
+pytestmark = [pytest.mark.unit, pytest.mark.virtual_time, pytest.mark.no_concurrent]
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -91,7 +98,6 @@ def _patch_job_ctx(mock_ctx: MagicMock, *, patch_recorder: bool = False) -> Iter
 def _make_mock_report(recording_options: RecordingOptions | None = None) -> MagicMock:
     """Create a minimal mock SessionReport for upload tests."""
     report = MagicMock()
-    report.recording_options = recording_options or _RECORDING_ALL_ON.copy()
     report.job_id = "job-1"
     report.room_id = "room-1"
     report.room = "test-room"
@@ -104,6 +110,7 @@ def _make_mock_report(recording_options: RecordingOptions | None = None) -> Magi
     report.started_at = 1000.0
     report.timestamp = 1010.0
     report.options = MagicMock()
+    report.options.recording_options = recording_options or _RECORDING_ALL_ON.copy()
     return report
 
 
@@ -113,6 +120,9 @@ def _make_mock_tagger(
     mock = MagicMock()
     mock.evaluations = evaluations or []
     mock.outcome_reason = outcome_reason
+    mock.tags = set()
+    mock._tags = {}
+    mock.outcome = "pass" if outcome_reason else None
     return mock
 
 
@@ -143,7 +153,9 @@ def _patch_upload_deps() -> Iterator[MagicMock]:
         patch(f"{_TRACES_MOD}.get_logger_provider") as mock_glp,
         patch(f"{_TRACES_MOD}.api.AccessToken") as mock_at,
     ):
-        mock_glp.return_value.get_logger.return_value = mock_logger
+        provider = mock_glp.return_value
+        provider.get_logger.return_value = mock_logger
+        mock_logger.provider = provider
         mock_token = MagicMock()
         mock_token.with_observability_grants.return_value = mock_token
         mock_token.with_ttl.return_value = mock_token
@@ -157,6 +169,7 @@ async def _call_upload(
     *,
     tagger: MagicMock | None = None,
     http_session: MagicMock | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     """Call _upload_session_report with sensible defaults."""
     await _upload_session_report(
@@ -165,6 +178,7 @@ async def _call_upload(
         report=report,
         tagger=tagger or _make_mock_tagger(),
         http_session=http_session or _make_mock_http(),
+        metadata=metadata,
     )
 
 
@@ -179,6 +193,24 @@ def _get_multipart_part_names(mp_writer: aiohttp.MultipartWriter) -> list[str]:
     return names
 
 
+def _get_multipart_parts(mp_writer: aiohttp.MultipartWriter) -> dict[str, Any]:
+    parts = {}
+    for payload, _enc, _te in mp_writer._parts:
+        cd = payload.headers.get("Content-Disposition", "")
+        for name in ("header", "chat_history", "audio"):
+            if f'name="{name}"' in cd:
+                parts[name] = payload
+    return parts
+
+
+def _retry_info_body(delay_seconds: int = 0) -> bytes:
+    retry_info = error_details_pb2.RetryInfo()
+    retry_info.retry_delay.seconds = delay_seconds
+    status = status_pb2.Status()
+    status.details.add().Pack(retry_info)
+    return status.SerializeToString()
+
+
 # ---------------------------------------------------------------------------
 # Group 1: RecordingOptions normalization (no JobContext)
 # ---------------------------------------------------------------------------
@@ -191,8 +223,25 @@ def _get_multipart_part_names(mp_writer: aiohttp.MultipartWriter) -> list[str]:
         pytest.param(False, _RECORDING_ALL_OFF, id="record=False"),
         pytest.param(
             {"audio": False},
-            {"audio": False, "traces": True, "logs": True, "transcript": True},
+            {
+                "audio": False,
+                "traces": True,
+                "logs": True,
+                "transcript": True,
+                "redaction": False,
+            },
             id="partial",
+        ),
+        pytest.param(
+            {"redaction": True},
+            {
+                "audio": True,
+                "traces": True,
+                "logs": True,
+                "transcript": True,
+                "redaction": True,
+            },
+            id="redaction",
         ),
     ],
 )
@@ -201,7 +250,7 @@ async def test_record_normalization(
 ) -> None:
     session = _create_simple_session()
     await session.start(SimpleAgent(), record=record)
-    assert session._recording_options == expected
+    assert session.options.recording_options == expected
     await _cleanup(session)
 
 
@@ -209,7 +258,7 @@ async def test_record_not_given_without_job_ctx() -> None:
     """When record is omitted and no JobContext is available, all options should be False."""
     session = _create_simple_session()
     await session.start(SimpleAgent())
-    assert session._recording_options == _RECORDING_ALL_OFF
+    assert session.options.recording_options == _RECORDING_ALL_OFF
     await _cleanup(session)
 
 
@@ -222,7 +271,13 @@ async def test_init_recording_called_with_options() -> None:
     """init_recording should be called with the correct RecordingOptions."""
     session = _create_simple_session()
     mock_ctx = _make_mock_job_ctx()
-    custom: RecordingOptions = {"audio": True, "traces": True, "logs": False, "transcript": True}
+    custom: RecordingOptions = {
+        "audio": True,
+        "traces": True,
+        "logs": False,
+        "transcript": True,
+        "redaction": True,
+    }
 
     with _patch_job_ctx(mock_ctx, patch_recorder=True):
         await session.start(SimpleAgent(), record=custom)
@@ -234,6 +289,7 @@ async def test_init_recording_called_with_options() -> None:
         "traces": True,
         "logs": False,
         "transcript": True,
+        "redaction": True,
     }
     await _cleanup(session)
 
@@ -273,7 +329,7 @@ async def test_init_recording_called_when_job_recording_disabled() -> None:
         await session.start(SimpleAgent())
 
     mock_ctx.init_recording.assert_called_once()
-    assert session._recording_options == _RECORDING_ALL_OFF
+    assert session.options.recording_options == _RECORDING_ALL_OFF
     await _cleanup(session)
 
 
@@ -285,7 +341,7 @@ async def test_init_recording_called_when_job_recording_disabled() -> None:
 async def test_upload_returns_early_when_none() -> None:
     """When all options are False, no HTTP request and no session report log should be made."""
     report = _make_mock_report(
-        {"audio": False, "traces": False, "logs": False, "transcript": False}
+        {"audio": False, "traces": False, "logs": False, "transcript": False, "redaction": True}
     )
     mock_http = MagicMock(spec=aiohttp.ClientSession)
     mock_http.post = MagicMock()
@@ -314,6 +370,134 @@ async def test_upload_transcript_only() -> None:
     assert "audio" not in part_names
 
 
+async def test_upload_uses_extended_timeout() -> None:
+    report = _make_mock_report({"audio": False, "traces": False, "logs": False, "transcript": True})
+    mock_http = _make_mock_http()
+
+    with _patch_upload_deps():
+        await _call_upload(report, http_session=mock_http)
+
+    timeout = mock_http.post.call_args.kwargs["timeout"]
+    assert timeout.total == 900
+    assert timeout.sock_connect == 30
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(aiohttp.ConnectionTimeoutError("connect timed out"), id="connect-timeout"),
+        pytest.param(
+            aiohttp.ClientConnectorError(MagicMock(), OSError("connection failed")),
+            id="connector-error",
+        ),
+    ],
+)
+async def test_upload_retries_connection_failure(error: Exception) -> None:
+    report = _make_mock_report({"audio": False, "traces": False, "logs": False, "transcript": True})
+    failure_cm = AsyncMock()
+    failure_cm.__aenter__.side_effect = error
+
+    success_resp = AsyncMock()
+    success_resp.status = 200
+    success_cm = AsyncMock()
+    success_cm.__aenter__.return_value = success_resp
+
+    mock_http = MagicMock(spec=aiohttp.ClientSession)
+    mock_http.post.side_effect = [failure_cm, success_cm]
+
+    with (
+        _patch_upload_deps(),
+        patch(f"{_TRACES_MOD}._recording_upload_retry_delay", return_value=0.0),
+    ):
+        await _call_upload(report, http_session=mock_http)
+
+    assert mock_http.post.call_count == 2
+
+
+async def test_upload_retries_response_with_retry_info() -> None:
+    report = _make_mock_report({"audio": False, "traces": False, "logs": False, "transcript": True})
+    retry_resp = AsyncMock()
+    retry_resp.status = 503
+    retry_resp.read.return_value = _retry_info_body()
+    retry_cm = AsyncMock()
+    retry_cm.__aenter__.return_value = retry_resp
+
+    success_resp = AsyncMock()
+    success_resp.status = 200
+    success_cm = AsyncMock()
+    success_cm.__aenter__.return_value = success_resp
+
+    mock_http = MagicMock(spec=aiohttp.ClientSession)
+    mock_http.post.side_effect = [retry_cm, success_cm]
+
+    with _patch_upload_deps():
+        await _call_upload(report, http_session=mock_http)
+
+    assert mock_http.post.call_count == 2
+
+
+async def test_upload_does_not_retry_response_without_retry_info() -> None:
+    report = _make_mock_report({"audio": False, "traces": False, "logs": False, "transcript": True})
+    response_error = aiohttp.ClientResponseError(
+        MagicMock(), (), status=503, message="service unavailable"
+    )
+    response = AsyncMock()
+    response.status = 503
+    response.read.return_value = b""
+    response.raise_for_status = MagicMock(side_effect=response_error)
+    response_cm = AsyncMock()
+    response_cm.__aenter__.return_value = response
+    mock_http = MagicMock(spec=aiohttp.ClientSession)
+    mock_http.post.return_value = response_cm
+
+    with _patch_upload_deps(), pytest.raises(aiohttp.ClientResponseError) as exc_info:
+        await _call_upload(report, http_session=mock_http)
+
+    assert exc_info.value.status == 503
+    assert mock_http.post.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(asyncio.TimeoutError("upload timed out"), id="total-timeout"),
+        pytest.param(aiohttp.ServerDisconnectedError("response lost"), id="disconnected"),
+        pytest.param(
+            aiohttp.ClientConnectorSSLError(MagicMock(), ssl.SSLError("TLS failed")),
+            id="tls-error",
+        ),
+    ],
+)
+async def test_upload_does_not_retry_ambiguous_or_tls_failure(error: Exception) -> None:
+    report = _make_mock_report({"audio": False, "traces": False, "logs": False, "transcript": True})
+    failure_cm = AsyncMock()
+    failure_cm.__aenter__.side_effect = error
+    mock_http = MagicMock(spec=aiohttp.ClientSession)
+    mock_http.post.return_value = failure_cm
+
+    with _patch_upload_deps(), pytest.raises(type(error)):
+        await _call_upload(report, http_session=mock_http)
+
+    assert mock_http.post.call_count == 1
+
+
+async def test_upload_stops_after_connection_retries_are_exhausted() -> None:
+    report = _make_mock_report({"audio": False, "traces": False, "logs": False, "transcript": True})
+    timeout_cm = AsyncMock()
+    timeout_cm.__aenter__.side_effect = aiohttp.ConnectionTimeoutError("connect timed out")
+    mock_http = MagicMock(spec=aiohttp.ClientSession)
+    mock_http.post.return_value = timeout_cm
+
+    with (
+        _patch_upload_deps(),
+        patch(f"{_TRACES_MOD}._recording_upload_retry_delay", return_value=0.0),
+        pytest.raises(aiohttp.ConnectionTimeoutError, match="connect timed out"),
+    ):
+        await _call_upload(report, http_session=mock_http)
+
+    assert mock_http.post.call_count == 4
+
+
 async def test_upload_session_report_sent_without_transcript() -> None:
     """Session report log should be emitted even when transcript=False, if other options are on."""
     report = _make_mock_report({"audio": True, "traces": True, "logs": False, "transcript": False})
@@ -325,6 +509,58 @@ async def test_upload_session_report_sent_without_transcript() -> None:
     bodies = [c.kwargs.get("body") for c in mock_logger.emit.call_args_list]
     assert "session report" in bodies
     assert "chat item" not in bodies
+
+
+async def test_upload_session_report_marks_stt_keyterms_as_pii() -> None:
+    report = _make_mock_report({"audio": False, "traces": True, "logs": False, "transcript": False})
+    stt_context_options = {
+        "keyterms": ["Acme Corp"],
+        "keyterm_detection": {"enabled": False},
+        "forward_chat_context": True,
+    }
+    report.options.stt_context_options = stt_context_options
+
+    with _patch_upload_deps() as mock_logger:
+        await _call_upload(report)
+
+    session_report_call = next(
+        c for c in mock_logger.emit.call_args_list if c.kwargs.get("body") == "session report"
+    )
+    serialized_stt_options = session_report_call.kwargs["attributes"]["session.options"][
+        "stt_context_options"
+    ]
+    assert serialized_stt_options["lk.pii.keyterms"] == ["Acme Corp"]
+    assert "keyterms" not in serialized_stt_options
+    assert stt_context_options["keyterms"] == ["Acme Corp"]
+
+
+def test_session_report_constructor_includes_recording_options_in_options() -> None:
+    from livekit.agents.voice.report import SessionReport
+
+    recording_options: RecordingOptions = {
+        "audio": False,
+        "traces": True,
+        "logs": False,
+        "transcript": False,
+        "redaction": True,
+    }
+    session = _create_simple_session()
+    session.options.recording_options = recording_options
+    report = SessionReport(
+        job_id="job-1",
+        room_id="room-1",
+        room="test-room",
+        options=session.options,
+        events=[],
+        chat_history=session.history,
+    )
+
+    assert report.options.recording_options == recording_options
+    serialized_recording_options = report.to_dict()["options"]["recording_options"]
+    assert serialized_recording_options == recording_options
+
+    serialized_recording_options["audio"] = True
+    assert report.options.recording_options["audio"] is False
 
 
 async def test_upload_audio_only_no_file() -> None:
@@ -355,6 +591,134 @@ async def test_upload_evaluations_emitted_without_logs() -> None:
     assert bodies.count("outcome") == 1
 
 
+async def test_upload_session_report_includes_simulation_metadata() -> None:
+    report = _make_mock_report({"audio": False, "traces": True, "logs": False, "transcript": False})
+    metadata = {
+        "lk.simulation.enabled": True,
+    }
+
+    with _patch_upload_deps() as mock_logger:
+        await _call_upload(report, metadata=metadata)
+
+    attrs = mock_logger.provider.get_logger.call_args_list[0].kwargs["attributes"]
+    assert attrs["lk.simulation.enabled"] is True
+    session_report_call = next(
+        c for c in mock_logger.emit.call_args_list if c.kwargs.get("body") == "session report"
+    )
+    assert "session.simulation" not in session_report_call.kwargs["attributes"]
+
+
+async def test_upload_session_report_includes_redaction_metadata() -> None:
+    report = _make_mock_report({"audio": False, "traces": True, "logs": False, "transcript": False})
+
+    with _patch_upload_deps() as mock_logger:
+        await _call_upload(report, metadata={"lk.redaction.enabled": True})
+
+    attrs = mock_logger.provider.get_logger.call_args_list[0].kwargs["attributes"]
+    assert attrs["lk.redaction.enabled"] is True
+
+
+async def test_upload_multipart_header_carries_simulation_redaction() -> None:
+    report = _make_mock_report({"audio": False, "traces": False, "logs": False, "transcript": True})
+    metadata = {
+        "lk.simulation.enabled": True,
+        "lk.redaction.enabled": True,
+    }
+    mock_http = _make_mock_http()
+
+    with _patch_upload_deps():
+        await _call_upload(report, http_session=mock_http, metadata=metadata)
+
+    mp_writer = mock_http.post.call_args.kwargs.get("data") or mock_http.post.call_args[1]["data"]
+    parts = _get_multipart_parts(mp_writer)
+    header = proto_metrics.MetricsRecordingHeader.FromString(parts["header"]._value)
+    assert header.simulated is True
+    assert header.redaction_enabled is True
+
+
+def test_job_context_otel_metadata_includes_redaction_option() -> None:
+    from livekit.agents.job import JobContext
+
+    ctx = object.__new__(JobContext)
+    ctx.simulation_context = MagicMock(return_value=None)
+
+    assert ctx._otel_metadata({"redaction": True}) == {"lk.redaction.enabled": True}
+
+
+def test_job_context_init_recording_enables_session_redaction() -> None:
+    from livekit.agents.job import JobContext
+
+    ctx = object.__new__(JobContext)
+    ctx._info = SimpleNamespace(
+        job=SimpleNamespace(enable_redaction=False),
+        url="",
+    )
+    ctx._recording_initialized = False
+    ctx._redaction_enabled = False
+    ctx._early_log_handler = None
+
+    ctx.init_recording(
+        {
+            "audio": False,
+            "traces": False,
+            "logs": False,
+            "transcript": False,
+            "redaction": True,
+        }
+    )
+
+    assert ctx._redaction_enabled is True
+
+
+@pytest.mark.parametrize(
+    ("project_redaction", "session_redaction"),
+    [
+        pytest.param(True, False, id="project-redaction"),
+        pytest.param(False, True, id="session-redaction"),
+    ],
+)
+def test_job_context_init_recording_rejects_audio_without_transcript_when_redacted(
+    project_redaction: bool, session_redaction: bool
+) -> None:
+    from livekit.agents.job import JobContext
+
+    ctx = object.__new__(JobContext)
+    ctx._info = SimpleNamespace(
+        job=SimpleNamespace(enable_redaction=project_redaction),
+        url="",
+    )
+    ctx._recording_initialized = False
+    ctx._redaction_enabled = project_redaction
+    ctx._early_log_handler = None
+
+    with pytest.raises(
+        ValueError, match="audio upload requires transcript upload when redaction is enabled"
+    ):
+        ctx.init_recording(
+            {
+                "audio": True,
+                "traces": False,
+                "logs": False,
+                "transcript": False,
+                "redaction": session_redaction,
+            }
+        )
+
+
+async def test_upload_session_report_omits_simulation_metadata_for_normal_session() -> None:
+    report = _make_mock_report({"audio": False, "traces": True, "logs": False, "transcript": False})
+
+    with _patch_upload_deps() as mock_logger:
+        await _call_upload(report)
+
+    attrs = mock_logger.provider.get_logger.call_args_list[0].kwargs["attributes"]
+    assert not any(k.startswith("lk.simulation.") for k in attrs)
+    session_report_call = next(
+        c for c in mock_logger.emit.call_args_list if c.kwargs.get("body") == "session report"
+    )
+    assert "session.simulation" not in session_report_call.kwargs["attributes"]
+
+
 def test_setup_cloud_tracer_logger_provider_always_created() -> None:
     """LoggerProvider should be set up even when enable_logs=False."""
     from livekit.agents.telemetry.traces import _setup_cloud_tracer
@@ -365,6 +729,7 @@ def test_setup_cloud_tracer_logger_provider_always_created() -> None:
         patch(f"{_TRACES_MOD}.set_logger_provider") as mock_slp,
         patch(f"{_TRACES_MOD}.OTLPLogExporter") as mock_exporter,
         patch(f"{_TRACES_MOD}.BatchLogRecordProcessor") as mock_blrp,
+        patch(f"{_TRACES_MOD}.Resource.create") as mock_resource_create,
         patch(f"{_TRACES_MOD}.logging"),
     ):
         mock_token = MagicMock()
@@ -381,12 +746,78 @@ def test_setup_cloud_tracer_logger_provider_always_created() -> None:
             **_observability_endpoint_arg(_setup_cloud_tracer),
             enable_traces=False,
             enable_logs=False,
+            metadata={"lk.simulation.enabled": True},
         )
 
     mock_slp.assert_called_once()
+    assert not any(k.startswith("lk.simulation.") for k in mock_resource_create.call_args.args[0])
     # OTLP exporter should NOT be created when enable_logs=False
     mock_exporter.assert_not_called()
     mock_blrp.assert_not_called()
+
+
+def _resource_attrs_for_env(env: dict[str, str]) -> dict[str, Any]:
+    """Run _setup_cloud_tracer under the given os.environ and return the dict
+    passed to Resource.create."""
+    from livekit.agents.telemetry.traces import _setup_cloud_tracer
+
+    with (
+        patch.dict("os.environ", env, clear=True),
+        patch(f"{_TRACES_MOD}.api.AccessToken") as mock_at,
+        patch(f"{_TRACES_MOD}.get_logger_provider", return_value=MagicMock()),
+        patch(f"{_TRACES_MOD}.set_logger_provider"),
+        patch(f"{_TRACES_MOD}.OTLPLogExporter"),
+        patch(f"{_TRACES_MOD}.BatchLogRecordProcessor"),
+        patch(f"{_TRACES_MOD}.Resource.create") as mock_resource_create,
+        patch(f"{_TRACES_MOD}.logging"),
+    ):
+        mock_token = MagicMock()
+        mock_token.with_observability_grants.return_value = mock_token
+        mock_token.with_ttl.return_value = mock_token
+        mock_token.to_jwt.return_value = "test-jwt"
+        mock_at.return_value = mock_token
+
+        _setup_cloud_tracer(
+            room_id="room-1",
+            job_id="job-1",
+            **_observability_endpoint_arg(_setup_cloud_tracer),
+            enable_traces=False,
+            enable_logs=False,
+        )
+    # Resource.create is also called internally by LoggerProvider() with an
+    # empty dict, so select the call that built the tracing resource (the one
+    # carrying service.name) rather than relying on call ordering.
+    for call in mock_resource_create.call_args_list:
+        attrs = call.args[0]
+        if "service.name" in attrs:
+            return attrs
+    raise AssertionError("Resource.create was not called with the service resource")
+
+
+def test_setup_cloud_tracer_adds_identity_from_env() -> None:
+    """LIVEKIT_AGENT_ID / LIVEKIT_AGENT_DEPLOYMENT become
+    lk.cloud_agent_id / lk.deployment_id on the tracing resource."""
+    attrs = _resource_attrs_for_env(
+        {"LIVEKIT_AGENT_ID": "CA_test123", "LIVEKIT_AGENT_DEPLOYMENT": "canary"}
+    )
+    assert attrs["lk.cloud_agent_id"] == "CA_test123"
+    assert attrs["lk.deployment_id"] == "canary"
+
+
+def test_setup_cloud_tracer_omits_identity_when_env_unset() -> None:
+    """Neither identity attr is set when the env vars are absent."""
+    attrs = _resource_attrs_for_env({})
+    assert "lk.cloud_agent_id" not in attrs
+    assert "lk.deployment_id" not in attrs
+
+
+def test_setup_cloud_tracer_omits_empty_deployment() -> None:
+    """An empty LIVEKIT_AGENT_DEPLOYMENT is omitted rather than emitted."""
+    attrs = _resource_attrs_for_env(
+        {"LIVEKIT_AGENT_ID": "CA_test123", "LIVEKIT_AGENT_DEPLOYMENT": ""}
+    )
+    assert attrs["lk.cloud_agent_id"] == "CA_test123"
+    assert "lk.deployment_id" not in attrs
 
 
 # ---------------------------------------------------------------------------
