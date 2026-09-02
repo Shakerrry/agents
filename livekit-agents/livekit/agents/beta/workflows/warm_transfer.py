@@ -28,6 +28,7 @@ from ...voice.background_audio import (
 from .utils import WorkflowInstructions
 
 if TYPE_CHECKING:
+    from ...job import JobContext
     from ...voice.turn import TurnDetectionMode
 
 
@@ -344,9 +345,16 @@ class WarmTransferTask(AgentTask[WarmTransferResult]):
             sip_request.ringing_timeout.FromNanoseconds(int(self._ringing_timeout * 1e9))
         if self._sip_connection is not None:
             sip_request.trunk.CopyFrom(self._sip_connection)
-        await job_ctx.api.sip.create_sip_participant(sip_request)
+        await self._create_sip_participant(job_ctx, sip_request)
 
         return human_agent_sess
+
+    async def _create_sip_participant(
+        self, job_ctx: JobContext, sip_request: api.CreateSIPParticipantRequest
+    ) -> None:
+        # FORK PATCH (autocalls): seam so subclasses can wrap the supervisor dial
+        # (e.g. retry on carrier CPS-limit rejections). Behaviour unchanged here.
+        await job_ctx.api.sip.create_sip_participant(sip_request)
 
     async def _merge_calls(self) -> None:
         assert self._caller_room is not None
