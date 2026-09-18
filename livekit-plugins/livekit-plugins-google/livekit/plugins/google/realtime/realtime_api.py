@@ -74,6 +74,7 @@ KNOWN_VERTEXAI_MODELS: frozenset[str] = frozenset(
 # See: https://ai.google.dev/gemini-api/docs/models#gemini-2.5-flash-live
 KNOWN_GEMINI_API_MODELS: frozenset[str] = frozenset(
     {
+        "gemini-3.8-live",
         "gemini-3.1-flash-live-preview",
         "gemini-2.5-flash-native-audio-preview-12-2025",
     }
@@ -817,15 +818,16 @@ class RealtimeSession(llm.RealtimeSession):
             logger.warning("per-response tools is not supported by Google Realtime API, ignoring")
         if not self._realtime_model.capabilities.mutable_chat_context:
             # FORK PATCH (bd9132248, extended 2026-05-17, re-verified on the
-            # 1.7.0 sync): Gemini 3.x reports mutable_chat_context=False (see
+            # 1.7.0 sync): Gemini 3.1 reports mutable_chat_context=False (see
             # `mutable = "3.1" not in model` in RealtimeModel.__init__), which
-            # upstream uses to reject generate_reply outright. Gemini 3.x does
+            # upstream uses to reject generate_reply outright. Gemini 3.1 does
             # support an initial-speech trigger via send_realtime_input(text=),
-            # handled by the gemini-3 branch further down in this method, so
-            # skip the early return for it. Other immutable-context models
+            # handled by the gemini-3.1 branch further down in this method, so
+            # skip the early return for it. Gemini 3.8 Live is mutable and must
+            # keep the send_client_content path. Other immutable-context models
             # (none currently in our DB) still get the original hard error.
             _model_base = self._opts.model.removeprefix("models/")
-            if not _model_base.startswith("gemini-3"):
+            if not _model_base.startswith("gemini-3.1"):
                 logger.warning(
                     f"generate_reply is not compatible with '{self._opts.model}' and will be ignored."
                 )
@@ -855,11 +857,12 @@ class RealtimeSession(llm.RealtimeSession):
             )
             self._in_user_activity = False
 
-        # FORK PATCH (bd9132248): Gemini 3.1+ rejects send_client_content for
+        # FORK PATCH (bd9132248): Gemini 3.1 rejects send_client_content for
         # non-initial-history use, so trigger generation with
-        # send_realtime_input(text=...) instead.
+        # send_realtime_input(text=...) instead. Gemini 3.8 Live restored
+        # full-session send_client_content — keep it on the 2.5 path.
         _model_base = self._opts.model.removeprefix("models/")
-        if _model_base.startswith("gemini-3"):
+        if _model_base.startswith("gemini-3.1"):
             prompt = instructions if is_given(instructions) else "."
             self._send_client_event(types.LiveClientRealtimeInput(text=prompt))
         else:
