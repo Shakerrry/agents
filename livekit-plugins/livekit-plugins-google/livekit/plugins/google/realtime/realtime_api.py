@@ -823,9 +823,9 @@ class RealtimeSession(llm.RealtimeSession):
             # upstream uses to reject generate_reply outright. Gemini 3.1 does
             # support an initial-speech trigger via send_realtime_input(text=),
             # handled by the gemini-3.1 branch further down in this method, so
-            # skip the early return for it. Gemini 3.8 Live is mutable and must
-            # keep the send_client_content path. Other immutable-context models
-            # (none currently in our DB) still get the original hard error.
+            # skip the early return for it. Gemini 3.8 Live is mutable so it
+            # never hits this guard. Other immutable-context models (none
+            # currently in our DB) still get the original hard error.
             _model_base = self._opts.model.removeprefix("models/")
             if not _model_base.startswith("gemini-3.1"):
                 logger.warning(
@@ -860,9 +860,14 @@ class RealtimeSession(llm.RealtimeSession):
         # FORK PATCH (bd9132248): Gemini 3.1 rejects send_client_content for
         # non-initial-history use, so trigger generation with
         # send_realtime_input(text=...) instead. Gemini 3.8 Live restored
-        # full-session send_client_content — keep it on the 2.5 path.
+        # send_client_content, but the 2.5 "role=model + dummy user '.'" path
+        # skips the first utterance, and a user-turn path treats the Initial
+        # message as caller speech (hotel bot replies in-character instead of
+        # following "Spune exact: …"). Use send_realtime_input for 3.8 too.
         _model_base = self._opts.model.removeprefix("models/")
-        if _model_base.startswith("gemini-3.1"):
+        if _model_base.startswith("gemini-3.1") or (
+            _model_base.startswith("gemini-3.8-live") and "extended-thinking" not in _model_base
+        ):
             prompt = instructions if is_given(instructions) else "."
             self._send_client_event(types.LiveClientRealtimeInput(text=prompt))
         else:
